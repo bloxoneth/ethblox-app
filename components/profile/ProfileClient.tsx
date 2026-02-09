@@ -19,9 +19,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { useToast } from "@/hooks/use-toast"
-import { Copy, Check, Edit3, ExternalLink, Download, User, Star } from "lucide-react"
-import { CONTRACTS } from "@/lib/contracts/ethblox-contracts"
-import { BuildPreview } from "@/components/build/BuildPreview"
+import { Copy, Check, Edit3, ExternalLink, Download, User, Star, Layers } from "lucide-react"
+import { CONTRACTS, tokenImageGatewayURL } from "@/lib/contracts/ethblox-contracts"
 import { calculateTotalBlox } from "@/lib/brick-utils"
 import type { Brick } from "@/lib/types"
 
@@ -39,9 +38,18 @@ interface MintedBuild {
   buildId: string
   name: string
   mass: number
+  kind?: number
+  brickWidth?: number
+  brickDepth?: number
+  density?: number
+  bw_score?: number
   buildHash?: string
+  geometryHash?: string
+  specKey?: string
   creator?: string
   bricks?: Brick[]
+  composition?: Record<string, { name: string; count: number }>
+  mintedAt?: string
 }
 
 interface ProfileClientProps {
@@ -329,16 +337,14 @@ export default function ProfileClient({ address }: ProfileClientProps) {
         <Card className="mb-8">
           <CardContent className="pt-6">
             <div className="flex flex-col md:flex-row items-start md:items-center gap-6">
-              {/* Avatar - 3D PFP Preview */}
+              {/* Avatar - IPFS Image PFP */}
               <div className="w-24 h-24 rounded-xl bg-[hsl(var(--ethblox-surface-elevated))] overflow-hidden shrink-0 border border-[hsl(var(--ethblox-border))]">
-                {pfpBuild && pfpBuild.bricks && pfpBuild.bricks.length > 0 ? (
-                  <div className="w-full h-full">
-                    <BuildPreview bricks={pfpBuild.bricks} />
-                  </div>
-                ) : profile?.pfpTokenId ? (
-                  <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-[hsl(var(--ethblox-yellow))] to-[hsl(var(--ethblox-accent-cyan))]">
-                    <span className="text-lg font-bold text-black">#{profile.pfpTokenId}</span>
-                  </div>
+                {profile?.pfpTokenId ? (
+                  <img
+                    src={tokenImageGatewayURL(profile.pfpTokenId)}
+                    alt={`PFP #${profile.pfpTokenId}`}
+                    className="w-full h-full object-contain bg-[hsl(var(--ethblox-bg))]"
+                  />
                 ) : (
                   <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-[hsl(var(--ethblox-yellow))] to-[hsl(var(--ethblox-accent-cyan))]">
                     <User className="h-10 w-10 text-black" />
@@ -619,7 +625,7 @@ export default function ProfileClient({ address }: ProfileClientProps) {
   )
 }
 
-// Build Card Component with 3D Preview
+// Build Card Component with IPFS Image
 function BuildCard({ 
   build, 
   onLoad, 
@@ -634,34 +640,51 @@ function BuildCard({
   isPfp?: boolean
 }) {
   const name = build.name || `Build #${build.tokenId}`
-  const mass = build.mass || 0
-  const hasBricks = build.bricks && build.bricks.length > 0
+  const kindLabel = (build.kind === 0 || build.kind === undefined) ? "Brick" : "Build"
+  const sizeLabel = build.brickWidth && build.brickDepth
+    ? `${build.brickWidth}x${build.brickDepth}`
+    : null
+  const imageUrl = tokenImageGatewayURL(build.tokenId)
 
   return (
     <Card className={`flex flex-col overflow-hidden ${isPfp ? 'ring-2 ring-[hsl(var(--ethblox-accent-cyan))]' : ''}`}>
-      {/* 3D Preview */}
-      <div className="w-full h-40 bg-[hsl(var(--ethblox-surface-elevated))] relative">
-        {hasBricks ? (
-          <BuildPreview bricks={build.bricks!} />
-        ) : (
-          <div className="w-full h-full flex items-center justify-center text-[hsl(var(--ethblox-text-tertiary))] text-sm">
-            No preview available
-          </div>
-        )}
-        <Badge variant="secondary" className="absolute top-2 right-2">
-          #{build.tokenId}
-        </Badge>
-        {isPfp && (
-          <Badge className="absolute top-2 left-2 bg-[hsl(var(--ethblox-accent-cyan))] text-black">
-            PFP
-          </Badge>
-        )}
-      </div>
+      {/* IPFS Image */}
+      <Link href={`/explore/${build.tokenId}`} className="block">
+        <div className="w-full aspect-square bg-[hsl(var(--ethblox-bg))] relative overflow-hidden">
+          <img
+            src={imageUrl}
+            alt={name}
+            className="w-full h-full object-contain hover:scale-105 transition-transform duration-300"
+            loading="lazy"
+          />
+          <span className="absolute top-2 right-2 text-[10px] font-mono px-1.5 py-0.5 rounded bg-black/60 text-white backdrop-blur-sm">
+            #{build.tokenId}
+          </span>
+          {isPfp && (
+            <Badge className="absolute top-2 left-2 bg-[hsl(var(--ethblox-accent-cyan))] text-black">
+              PFP
+            </Badge>
+          )}
+        </div>
+      </Link>
       
       <CardHeader className="pb-2 pt-3">
         <CardTitle className="line-clamp-1 text-base">{name}</CardTitle>
         <CardDescription>
-          {mass > 0 ? `${mass} BLOX` : `${build.bricks?.length || 0} bricks`}
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="px-1.5 py-0.5 rounded bg-[hsl(var(--ethblox-bg))] text-[hsl(var(--ethblox-text-secondary))] text-xs">
+              {kindLabel}
+            </span>
+            {sizeLabel && (
+              <span className="flex items-center gap-1 text-xs">
+                <Layers className="h-3 w-3" />
+                {sizeLabel}
+              </span>
+            )}
+            {build.mass > 0 && (
+              <span className="text-xs">{build.mass} BLOX</span>
+            )}
+          </div>
         </CardDescription>
       </CardHeader>
       
@@ -681,13 +704,9 @@ function BuildCard({
           </Button>
         )}
         <Button variant="outline" size="sm" asChild>
-          <a
-            href={`https://sepolia.basescan.org/nft/${CONTRACTS.BUILD_NFT}/${build.tokenId}`}
-            target="_blank"
-            rel="noopener noreferrer"
-          >
+          <Link href={`/explore/${build.tokenId}`}>
             <ExternalLink className="h-4 w-4" />
-          </a>
+          </Link>
         </Button>
       </CardFooter>
     </Card>

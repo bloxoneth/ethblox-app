@@ -25,7 +25,7 @@ function BrickMesh({ brick }: { brick: Brick }) {
       </mesh>
       {studs.map((pos, idx) => (
         <mesh key={idx} position={pos as [number, number, number]} castShadow>
-          <cylinderGeometry args={[0.155, 0.155, 0.05, 16]} />
+          <sphereGeometry args={[0.155, 12, 6, 0, Math.PI * 2, 0, Math.PI / 2]} />
           <meshStandardMaterial color={brick.color} roughness={0.5} metalness={0.05} />
         </mesh>
       ))}

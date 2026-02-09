@@ -17,7 +17,7 @@ function StandardBrickMesh({ brick }: { brick: Brick }) {
     for (let j = 0; j < Math.floor(brick.depth); j++) {
       studs.push([
         i - brick.width / 2 + 0.5,
-        BRICK_CONFIG.height / 2 + BRICK_CONFIG.studHeight / 2,
+        BRICK_CONFIG.height / 2 + 0.025,
         j - brick.depth / 2 + 0.5,
       ])
     }
@@ -35,7 +35,7 @@ function StandardBrickMesh({ brick }: { brick: Brick }) {
       </mesh>
       {studs.map((pos, idx) => (
         <mesh key={idx} position={pos} castShadow>
-          <cylinderGeometry args={[BRICK_CONFIG.studRadius, BRICK_CONFIG.studRadius, BRICK_CONFIG.studHeight, 16]} />
+          <sphereGeometry args={[BRICK_CONFIG.studRadius, 12, 6, 0, Math.PI * 2, 0, Math.PI / 2]} />
           <meshStandardMaterial
             color={brick.color}
             roughness={BRICK_CONFIG.roughness}
@@ -209,7 +209,7 @@ export function StandardBuildCapture({
         <Canvas
           ref={canvasRef}
           shadows
-          camera={{ fov: BUILD_CAPTURE_CONFIG.camera.fov }}
+          camera={{ fov: BUILD_CAPTURE_CONFIG.camera.fov, position: [5, 5, 5] }}
           gl={{
             preserveDrawingBuffer: true,
             antialias: BUILD_CAPTURE_CONFIG.render.antialias,

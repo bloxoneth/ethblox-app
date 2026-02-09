@@ -1,7 +1,7 @@
 "use client"
 
 import { Canvas } from "@react-three/fiber"
-import { OrbitControls, PerspectiveCamera } from "@react-three/drei"
+import { OrbitControls } from "@react-three/drei"
 import type { Brick } from "@/lib/types"
 
 interface BuildPreviewProps {
@@ -43,8 +43,7 @@ export function BuildPreview({ bricks }: BuildPreviewProps) {
 
   return (
     <div className="w-full h-full min-h-[8rem] bg-[hsl(var(--ethblox-surface-elevated))] rounded overflow-hidden">
-      <Canvas>
-        <PerspectiveCamera makeDefault position={[cameraDistance, cameraDistance, cameraDistance]} />
+      <Canvas camera={{ position: [cameraDistance, cameraDistance, cameraDistance], fov: 50 }}>
         <OrbitControls enableZoom={false} enablePan={false} autoRotate autoRotateSpeed={2} />
         <ambientLight intensity={0.6} />
         <directionalLight position={[10, 10, 5]} intensity={0.8} />

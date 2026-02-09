@@ -45,7 +45,7 @@ import { useBloxBalance } from "@/lib/web3/hooks/useBloxBalance"
 import { MintBuildModal } from "./MintBuildModal"
 import { BrickMintModal } from "./BrickMintModal"
 import { calculateTotalBlox } from "@/lib/brick-utils"
-import { getBrickByDimensions, type BrickNFT } from "@/data/bricks"
+import { getBrickByDimensions, type BrickNFT, BRICK_DENSITIES, normalizeBrickKey } from "@/data/bricks"
 
 const BRICK_HEIGHT = 1.0
 const GROUND_HEIGHT = 0.25
@@ -365,45 +365,55 @@ function InstancedStuds({
 
 // Space floor with dynamic used area highlighting - optimized with instancing
 function SpaceFloor({ bricks }: { bricks: Brick[] }) {
-  // Calculate used area bounds from bricks (no padding - exact fit)
-  const usedBounds = React.useMemo(() => {
-    if (bricks.length === 0) {
-      return { minX: -3, maxX: 3, minZ: -3, maxZ: 3 }
-    }
-    
-    let minX = Infinity, maxX = -Infinity
-    let minZ = Infinity, maxZ = -Infinity
-    
-    for (const brick of bricks) {
-      const halfW = brick.width / 2
-      const halfD = brick.depth / 2
-      minX = Math.min(minX, brick.position[0] - halfW)
-      maxX = Math.max(maxX, brick.position[0] + halfW)
-      minZ = Math.min(minZ, brick.position[2] - halfD)
-      maxZ = Math.max(maxZ, brick.position[2] + halfD)
-    }
-    
-    return {
-      minX: Math.floor(minX),
-      maxX: Math.ceil(maxX),
-      minZ: Math.floor(minZ),
-      maxZ: Math.ceil(maxZ)
-    }
-  }, [bricks])
-  
-  // Generate stud positions - optimized with direct array creation
+  // Compute exact occupied cells + 1-cell border that hugs the build
   const { usedStuds, unusedStuds } = React.useMemo(() => {
     const used: [number, number, number][] = []
     const unused: [number, number, number][] = []
     const halfFloor = FLOOR_SIZE / 2
     const y = GROUND_HEIGHT / 2
     
+    if (bricks.length === 0) {
+      // No bricks - all studs are "unused" dark ones
+      for (let x = -halfFloor; x < halfFloor; x++) {
+        for (let z = -halfFloor; z < halfFloor; z++) {
+          unused.push([x, y, z])
+        }
+      }
+      return { usedStuds: used, unusedStuds: unused }
+    }
+    
+    // Build a set of all grid cells occupied by bricks (ground-level projection)
+    const occupiedCells = new Set<string>()
+    for (const brick of bricks) {
+      const startX = Math.round(brick.position[0] - brick.width / 2)
+      const startZ = Math.round(brick.position[2] - brick.depth / 2)
+      for (let dx = 0; dx < brick.width; dx++) {
+        for (let dz = 0; dz < brick.depth; dz++) {
+          occupiedCells.add(`${startX + dx},${startZ + dz}`)
+        }
+      }
+    }
+    
+    // Build a border set: cells adjacent to occupied cells but not occupied themselves
+    const borderCells = new Set<string>()
+    for (const key of occupiedCells) {
+      const [cx, cz] = key.split(",").map(Number)
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          if (dx === 0 && dz === 0) continue
+          const nk = `${cx + dx},${cz + dz}`
+          if (!occupiedCells.has(nk)) {
+            borderCells.add(nk)
+          }
+        }
+      }
+    }
+    
+    // Now classify every floor stud
     for (let x = -halfFloor; x < halfFloor; x++) {
       for (let z = -halfFloor; z < halfFloor; z++) {
-        const isUsed = x >= usedBounds.minX && x <= usedBounds.maxX && 
-                       z >= usedBounds.minZ && z <= usedBounds.maxZ
-        
-        if (isUsed) {
+        const key = `${x},${z}`
+        if (occupiedCells.has(key) || borderCells.has(key)) {
           used.push([x, y, z])
         } else {
           unused.push([x, y, z])
@@ -412,7 +422,7 @@ function SpaceFloor({ bricks }: { bricks: Brick[] }) {
     }
     
     return { usedStuds: used, unusedStuds: unused }
-  }, [usedBounds])
+  }, [bricks])
   
   return (
     <group>
@@ -699,6 +709,7 @@ export default function V0Blocks({
   initialBricks,
   onAutoSave,
   onClearNFTMode,
+  onSetBrickSize,
   onOpenNFTDrawer,
   onRotateNFT,
   onBrickCountsChange,
@@ -715,6 +726,7 @@ export default function V0Blocks({
   initialBricks?: Brick[]
   onAutoSave?: (bricks: Brick[]) => void
   onClearNFTMode?: () => void
+  onSetBrickSize?: { width: number; depth: number } | null
   onOpenNFTDrawer?: () => void
   onRotateNFT?: () => void
   onBrickCountsChange?: (counts: Array<{ width: number; depth: number; count: number; minted: boolean }>) => void
@@ -727,6 +739,23 @@ export default function V0Blocks({
   const [colorIndex, setColorIndex] = useState(1)
   const [width, setWidth] = useState(1)
   const [depth, setDepth] = useState(3)
+  const [density, setDensity] = useState(1)
+  
+  // Set of minted brick keys loaded from Redis: e.g. "1x1-D1", "2x2-D27"
+  const [mintedBrickKeys, setMintedBrickKeys] = useState<Set<string>>(new Set())
+  
+  // Load minted brick keys from Redis on mount
+  useEffect(() => {
+    fetch("/api/builds/check-minted")
+      .then(r => r.json())
+      .then(data => {
+        if (data.mintedBricks?.length > 0) {
+          setMintedBrickKeys(new Set(data.mintedBricks))
+          console.log("[v0] Loaded minted bricks from Redis:", data.mintedBricks)
+        }
+      })
+      .catch(() => {})
+  }, [])
   const [ghostBrick, setGhostBrick] = useState<Brick | null>(null)
   const [groundHighlight, setGroundHighlight] = useState<any>(null)
   const [isPlaying, setIsPlaying] = useState(false)
@@ -790,9 +819,17 @@ export default function V0Blocks({
     setDepth(newDepth)
   }, [onClearNFTMode])
 
+  // Allow parent to set brick size (used for Kind 0 single-brick NFTs)
+  useEffect(() => {
+    if (onSetBrickSize) {
+      setWidth(onSetBrickSize.width)
+      setDepth(onSetBrickSize.depth)
+    }
+  }, [onSetBrickSize])
+
   // baseWidth/baseDepth removed - floor is now dynamic based on bricks
   
-  // Calculate brick type usage counts
+  // Calculate brick type usage counts - check minted status from Redis set, not static ALL_BRICKS
   const brickCounts = React.useMemo(() => {
     const counts: Record<string, { width: number; depth: number; count: number; minted: boolean }> = {}
     
@@ -802,19 +839,20 @@ export default function V0Blocks({
       
       const key = `${brick.width}x${brick.depth}`
       if (!counts[key]) {
-        const brickNFT = getBrickByDimensions(brick.width, brick.depth)
+        // Use mintedBrickKeys (loaded from Redis) to check minted status
+        const brickKey = normalizeBrickKey(brick.width, brick.depth, density)
         counts[key] = { 
           width: brick.width, 
           depth: brick.depth, 
           count: 0,
-          minted: brickNFT?.minted ?? false
+          minted: mintedBrickKeys.has(brickKey)
         }
       }
       counts[key].count++
     }
     
     return Object.values(counts).sort((a, b) => b.count - a.count)
-  }, [bricks])
+  }, [bricks, mintedBrickKeys, density])
   
   // Notify parent when brick counts change
   useEffect(() => {
@@ -1149,21 +1187,27 @@ export default function V0Blocks({
       }
 
       if (!checkCollision(newBrick, bricks)) {
-        // Check if brick NFT is minted
-        const brickNFT = getBrickByDimensions(ghostBrick.width, ghostBrick.depth)
+        // Check if this brick size+density is minted (via Redis-cached set, normalized so 1x2 == 2x1)
+        const brickKey = normalizeBrickKey(ghostBrick.width, ghostBrick.depth, density)
         
-        if (brickNFT && !brickNFT.minted) {
-          // Brick is not minted - show mint modal
-          setPendingBrickNFT(brickNFT)
-          setPendingBrickPlacement(newBrick)
-          setBrickMintModalOpen(true)
-          toast({ 
-            title: "Unminted Brick", 
-            description: `${ghostBrick.width}x${ghostBrick.depth} brick needs to be minted first`,
-          })
-        } else {
-          // Brick is minted or not found (allow placement)
+        if (mintedBrickKeys.has(brickKey)) {
+          // Minted - allow placement
           addToHistory([...bricks, newBrick])
+        } else {
+          // Not minted - show mint modal
+          const brickNFT = getBrickByDimensions(ghostBrick.width, ghostBrick.depth, density)
+          if (brickNFT) {
+            setPendingBrickNFT(brickNFT)
+            setPendingBrickPlacement(newBrick)
+            setBrickMintModalOpen(true)
+            toast({
+              title: "Unminted Brick",
+              description: `${brickKey} needs to be minted first`,
+            })
+          } else {
+            // Brick not in catalogue - allow placement
+            addToHistory([...bricks, newBrick])
+          }
         }
       }
     },
@@ -1175,6 +1219,8 @@ export default function V0Blocks({
       nftGeometry,
       nftInfo,
       isPlacing,
+      density,
+      mintedBrickKeys,
       addToHistory,
       checkCollision,
       calculateYPosition,
@@ -1920,6 +1966,26 @@ ghostPositionRef.current = { x: snappedX, z: snappedZ }
                   ))}
                 </DropdownMenuContent>
               </DropdownMenu>
+              
+              <div className="w-px h-5 bg-zinc-700 mx-1" />
+              
+              {/* Density selector */}
+              <span className="text-[10px] text-zinc-500 uppercase tracking-wider">D</span>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button size="sm" variant="ghost" className="text-white font-mono text-xs h-7 px-1.5">
+                    {density} <ChevronDown className="h-2.5 w-2.5 ml-0.5" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent>
+                  {BRICK_DENSITIES.map((d) => (
+                    <DropdownMenuItem key={d} onClick={() => { onClearNFTMode?.(); setDensity(d) }}>
+                      {d} <span className="ml-2 text-xs text-muted-foreground">{d === 1 ? "Hollow" : d === 8 ? "Light" : d === 27 ? "Standard" : d === 64 ? "Dense" : "Ultra"}</span>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+              
               <div className="w-px h-5 bg-zinc-700 mx-1" />
               <Button
                 size="icon"
@@ -1950,7 +2016,7 @@ ghostPositionRef.current = { x: snappedX, z: snappedZ }
           <button
             onClick={() => setIsBottomBarCollapsed(!isBottomBarCollapsed)}
             className={`absolute left-1/2 -translate-x-1/2 z-30 md:hidden bg-[hsl(210,11%,18%)] backdrop-blur-lg border border-[hsl(210,8%,28%)] border-b-0 shadow-2xl text-zinc-400 hover:text-white transition-all duration-300 rounded-t-lg px-4 py-1 ${
-              isBottomBarCollapsed ? "bottom-0" : "bottom-[88px]"
+              isBottomBarCollapsed ? "bottom-[env(safe-area-inset-bottom)]" : "bottom-[calc(88px+env(safe-area-inset-bottom))]"
             }`}
           >
             {isBottomBarCollapsed ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
@@ -1959,7 +2025,7 @@ ghostPositionRef.current = { x: snappedX, z: snappedZ }
           <div className={`absolute left-0 right-0 z-30 md:hidden transition-all duration-300 ${
             isBottomBarCollapsed ? "-bottom-24" : "bottom-0"
           }`}>
-            <div className="bg-[hsl(210,11%,18%)] border-t border-[hsl(210,8%,28%)] px-2 py-2 pb-3">
+            <div className="bg-[hsl(210,11%,18%)] border-t border-[hsl(210,8%,28%)] px-2 py-2 pb-[calc(0.75rem+env(safe-area-inset-bottom))]">
               {/* Color palette - smaller circles */}
               <div className="flex items-center justify-center gap-2 mb-2">
                 {colors.map((color, i) => (
@@ -2022,6 +2088,35 @@ ghostPositionRef.current = { x: snappedX, z: snappedZ }
                     size="sm"
                     variant="ghost"
                     onClick={() => handleDepthChange((d) => Math.min(FLOOR_SIZE, d + 1))}
+                    className="h-7 w-7 text-zinc-400 p-0 text-sm"
+                  >
+                    +
+                  </Button>
+                </div>
+                <div className="w-px h-5 bg-zinc-700" />
+                {/* Mobile density selector */}
+                <div className="flex items-center bg-black/30 rounded-lg">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      onClearNFTMode?.()
+                      const idx = BRICK_DENSITIES.indexOf(density)
+                      if (idx > 0) setDensity(BRICK_DENSITIES[idx - 1])
+                    }}
+                    className="h-7 w-7 text-zinc-400 p-0 text-sm"
+                  >
+                    -
+                  </Button>
+                  <span className="text-white font-mono w-6 text-center text-[10px]">D{density}</span>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      onClearNFTMode?.()
+                      const idx = BRICK_DENSITIES.indexOf(density)
+                      if (idx < BRICK_DENSITIES.length - 1) setDensity(BRICK_DENSITIES[idx + 1])
+                    }}
                     className="h-7 w-7 text-zinc-400 p-0 text-sm"
                   >
                     +
@@ -2175,8 +2270,12 @@ ghostPositionRef.current = { x: snappedX, z: snappedZ }
       }
     }}
     brick={pendingBrickNFT}
-    onMintSuccess={() => {
-      // After mint, place the brick
+    onMintSuccess={(mintedBrick) => {
+      // Add to local minted set so future placements are instant (normalized)
+      if (mintedBrick) {
+        const key = normalizeBrickKey(mintedBrick.width, mintedBrick.depth, mintedBrick.density)
+        setMintedBrickKeys(prev => new Set([...prev, key]))
+      }
       if (pendingBrickPlacement) {
         addToHistory([...bricks, pendingBrickPlacement])
       }

@@ -118,17 +118,29 @@ export default function GalleryClient() {
             {filteredBuilds.map((build) => {
               const name = build.name || `Build #${build.tokenId}`
               const mass = build.mass || 0
+              const isBrick = build.kind === 0
+              const brickCount = build.bricks?.length || 0
 
               return (
                 <Card key={build.tokenId} className="flex flex-col">
                   <CardHeader>
                     <div className="flex items-start justify-between gap-2">
                       <CardTitle className="line-clamp-1">{name}</CardTitle>
-                      <Badge variant="secondary" className="shrink-0">
-                        #{build.tokenId}
-                      </Badge>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {isBrick && (
+                          <Badge variant="outline" className="text-xs">Brick</Badge>
+                        )}
+                        <Badge variant="secondary">
+                          #{build.tokenId}
+                        </Badge>
+                      </div>
                     </div>
-                    <CardDescription>{mass > 0 ? `${mass} BLOX` : "Minted Build NFT"}</CardDescription>
+                    <CardDescription>
+                      {isBrick 
+                        ? `${build.brickWidth || 1}x${build.brickDepth || 1} - Density ${build.density || 1} - Mass ${mass}`
+                        : mass > 0 ? `${brickCount} brick${brickCount !== 1 ? "s" : ""} - Mass ${mass}` : "Minted Build NFT"
+                      }
+                    </CardDescription>
                   </CardHeader>
                   <CardContent className="flex-1">
                     <dl className="space-y-2 text-sm">

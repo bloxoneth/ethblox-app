@@ -1,7 +1,7 @@
 "use client"
 
-import { useState, useEffect } from "react"
-import { useRouter } from "next/navigation"
+import { useState, useEffect, useRef } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
@@ -23,6 +23,9 @@ import {
   CONTRACTS,
   FEE_PER_MINT,
   BUILD_KIND,
+  BASE_METADATA_URI,
+  tokenMetadataURI,
+  tokenImageURI,
   getBloxBalance,
   getBloxAllowance,
   getMaxMass,
@@ -33,6 +36,9 @@ import {
   approveBlox,
   mintBuildNFTWithParams,
   addMintedHash,
+  runMintDiagnostics,
+  simulateMint,
+  encodeMintCalldata,
   type MintParams,
 } from "@/lib/contracts/ethblox-contracts"
 import { generateBuildHash } from "@/lib/build-hash"
@@ -78,11 +84,30 @@ interface ValidationResult {
   details?: string
 }
 
-// Generate specKey: keccak256(geometryHash, width, depth)
-function generateSpecKey(geometryHash: string, width: number, depth: number): string {
-  const encoded = ethers.AbiCoder.defaultAbiCoder().encode(
-    ["bytes32", "uint8", "uint8"],
-    [geometryHash, width, depth]
+// Determine build kind: explicit URL kind=0 means brick, otherwise multi-brick = BUILD
+function detectKind(
+  searchParams: URLSearchParams, 
+  brickCount: number, 
+  composition?: Record<string, any>
+): number {
+  const urlKind = searchParams.get("kind")
+  if (urlKind === "0") return BUILD_KIND.BRICK
+  if (urlKind === "1") return BUILD_KIND.BUILD
+  // Multi-brick assemblies are builds (kind=1), even without NFT composition
+  if (brickCount > 1) return BUILD_KIND.BUILD
+  // Has NFT components = build
+  if (composition && Object.keys(composition).length > 0) return BUILD_KIND.BUILD
+  return BUILD_KIND.BRICK
+}
+
+// Generate specKey: keccak256(abi.encodePacked(width, depth, density))
+// Must include density - this was the root cause of the density=1 bug
+function generateSpecKey(width: number, depth: number, density: number): string {
+  const w = Math.min(width, depth)
+  const d = Math.max(width, depth)
+  const encoded = ethers.solidityPacked(
+    ["uint8", "uint8", "uint16"],
+    [w, d, density]
   )
   return ethers.keccak256(encoded)
 }
@@ -100,6 +125,7 @@ function generateComponentsHash(componentIds: string[]): string {
 
 export function MintDebugClient() {
   const router = useRouter()
+  const searchParams = useSearchParams()
   const { account, isConnected, connect, switchChain } = useMetaMask()
   
   const [debugData, setDebugData] = useState<MintDebugData | null>(null)
@@ -124,19 +150,63 @@ export function MintDebugClient() {
   const [approving, setApproving] = useState(false)
   const [mintTxHash, setMintTxHash] = useState<string | null>(null)
   const [mintError, setMintError] = useState<string | null>(null)
+  const [diagnostics, setDiagnostics] = useState<Record<string, string> | null>(null)
+  const [runningDiagnostics, setRunningDiagnostics] = useState(false)
 
-  // Load debug data from sessionStorage
+  // Load debug data from sessionStorage or URL params (from BrickMintModal redirect)
+  // Runs once on mount only - searchParams are stable from useSearchParams()
+  const dataLoadedRef = useRef(false)
   useEffect(() => {
+    if (dataLoadedRef.current) return
+    dataLoadedRef.current = true
+
+    // Check URL params first (from BrickMintModal redirect)
+    const kind = searchParams.get("kind")
+    const brickWidth = searchParams.get("width")
+    const brickDepth = searchParams.get("depth")
+    const brickDensity = searchParams.get("density")
+    const brickName = searchParams.get("name")
+    
+    if (kind === "0" && brickWidth && brickDepth) {
+      const w = parseInt(brickWidth)
+      const d = parseInt(brickDepth)
+      const dens = brickDensity ? parseInt(brickDensity) : 1
+      const name = brickName || `${w}x${d}-D${dens}`
+      
+      setDebugData({
+        buildId: `brick_${w}x${d}_d${dens}`,
+        buildName: name,
+        buildHash: null,
+        bricks: [{ id: "1", position: [0, 0.5, 0] as [number, number, number], color: "#e8d44d", width: w, depth: d }],
+        baseWidth: w,
+        baseDepth: d,
+        totalBloxMass: w * d * dens,
+        uniqueColors: 1,
+        timestamp: Date.now(),
+        metadata: {
+          buildWidth: w,
+          buildDepth: d,
+          totalBricks: 1,
+          totalInstances: 1,
+          nftsUsed: 0,
+        },
+      })
+      setLoading(false)
+      return
+    }
+    
+    // Fallback: load from sessionStorage
     const stored = sessionStorage.getItem("ethblox_mint_debug")
     if (stored) {
       try {
         const data = JSON.parse(stored)
         setDebugData(data)
       } catch (e) {
-        console.error("[v0] Failed to parse mint debug data:", e)
+        console.error("Failed to parse mint debug data:", e)
       }
     }
     setLoading(false)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Generate hash when data is loaded
@@ -161,19 +231,15 @@ export function MintDebugClient() {
   const fetchContractState = async () => {
     if (!isConnected || !account) return
     
+    const ethereum = (window as any).ethereum
+    if (!ethereum) return
+
     setRefreshing(true)
     try {
-      const ethereum = (window as any).ethereum
-      if (!ethereum) return
-
       const chainId = await ethereum.request({ method: "eth_chainId" })
-      // Compare chain IDs by converting both to decimal numbers for accurate comparison
-      // This handles cases where hex strings have different padding (0x14a34 vs 0x014a34)
       const currentChainDecimal = chainId ? parseInt(chainId, 16) : 0
-      const expectedChainDecimal = parseInt(CONTRACTS.BASE_SEPOLIA_CHAIN_ID, 16) // 84532
+      const expectedChainDecimal = parseInt(CONTRACTS.BASE_SEPOLIA_CHAIN_ID, 16)
       const isCorrectChain = currentChainDecimal === expectedChainDecimal
-      
-      
 
       const provider = new ethers.BrowserProvider(ethereum)
 
@@ -184,7 +250,6 @@ export function MintDebugClient() {
         getNextTokenId(provider).catch(() => null),
       ])
 
-      // Get component token IDs from composition
       const componentTokenIds = debugData?.composition 
         ? Object.keys(debugData.composition).map(id => BigInt(id))
         : []
@@ -222,9 +287,51 @@ export function MintDebugClient() {
     setRefreshing(false)
   }
 
+  // Fetch on connection changes, with retry for slow MetaMask initialization
   useEffect(() => {
+    if (!isConnected || !account) return
+
+    // Fetch immediately
     fetchContractState()
+
+    // Retry after a short delay in case MetaMask provider wasn't fully ready
+    const retryTimer = setTimeout(() => {
+      fetchContractState()
+    }, 1500)
+
+    return () => clearTimeout(retryTimer)
   }, [isConnected, account, debugData])
+
+  // Also poll for ethereum provider if wallet was previously connected but provider is slow to inject
+  useEffect(() => {
+    if (isConnected && account) return // Already connected, no need to poll
+    
+    const savedAccount = typeof window !== "undefined" ? localStorage.getItem("metamask_account") : null
+    if (!savedAccount) return // No saved session
+
+    // MetaMask provider can be slow to inject on page load - poll for it
+    let attempts = 0
+    const maxAttempts = 10
+    const pollInterval = setInterval(() => {
+      attempts++
+      const ethereum = (window as any).ethereum
+      if (ethereum && ethereum.isMetaMask) {
+        clearInterval(pollInterval)
+        // Provider is now available - the MetaMask context should pick it up
+        // but trigger a re-check just in case
+        ethereum.request({ method: "eth_accounts" }).then((accounts: string[]) => {
+          if (accounts.length > 0) {
+            fetchContractState()
+          }
+        }).catch(() => {})
+      }
+      if (attempts >= maxAttempts) {
+        clearInterval(pollInterval)
+      }
+    }, 500)
+
+    return () => clearInterval(pollInterval)
+  }, [])
 
   const copyToClipboard = (text: string, label: string) => {
     navigator.clipboard.writeText(text)
@@ -259,8 +366,136 @@ export function MintDebugClient() {
     setApproving(false)
   }
 
-  // Handle mint
-  const handleMint = async () => {
+  // Build mint params helper
+  const buildMintParams = (): MintParams | null => {
+    if (!debugData || !generatedHash) return null
+    
+    const kind = detectKind(searchParams, debugData.bricks.length, debugData.composition)
+    const hasComponents = debugData.composition && Object.keys(debugData.composition).length > 0
+    
+    let componentIds: bigint[] = []
+    let componentCounts: bigint[] = []
+    
+    if (hasComponents && debugData.composition) {
+      const validComponents = Object.entries(debugData.composition)
+        .filter(([id, data]) => Number(id) > 0 && data.count > 0)
+      componentIds = validComponents.map(([id]) => BigInt(id))
+      componentCounts = validComponents.map(([, data]) => BigInt(data.count))
+    }
+
+    // Read density from URL params or sessionStorage data
+    const urlDensity = searchParams.get("density")
+    let mintDensity = urlDensity ? parseInt(urlDensity) : 0
+    
+    // For bricks, density is REQUIRED and must be valid
+    const validDensities = [1, 8, 27, 64, 125]
+    if (kind === BUILD_KIND.BRICK) {
+      if (!mintDensity || !validDensities.includes(mintDensity)) {
+        setMintError(`Density is required for brick mints. Got: ${mintDensity || "none"}. Valid values: ${validDensities.join(", ")}. Go back and select a density in the brick mint modal.`)
+        return null
+      }
+    }
+    
+    // For builds (kind > 0), density defaults to 1 (single assembly)
+    if (kind !== BUILD_KIND.BRICK && !mintDensity) {
+      mintDensity = 1
+    }
+
+    return {
+      geometryHash: generatedHash,
+      mass: debugData.totalBloxMass,
+      uri: "",
+      componentBuildIds: componentIds,
+      componentCounts: componentCounts,
+      kind,
+      width: debugData.baseWidth,
+      depth: debugData.baseDepth,
+      density: mintDensity,
+    }
+  }
+
+  // Run diagnostics
+  const handleRunDiagnostics = async () => {
+    if (!isConnected || !account || !debugData || !generatedHash) return
+    setRunningDiagnostics(true)
+    setDiagnostics(null)
+    
+    try {
+      const ethereum = (window as any).ethereum
+      if (!ethereum) throw new Error("No wallet found")
+      const provider = new ethers.BrowserProvider(ethereum)
+      
+      const params = buildMintParams()
+      if (!params) {
+        setDiagnostics({ "ERROR": "Could not build mint params - check density is set in URL (?density=8)" })
+        setRunningDiagnostics(false)
+        return
+      }
+      
+      const results = await runMintDiagnostics(provider, params, account)
+      
+      // Add full decoded payload
+      results["--- PAYLOAD BEING SENT ---"] = ""
+      results["[0] geometryHash (bytes32)"] = params.geometryHash
+      results["[1] mass (uint256)"] = BigInt(params.mass).toString()
+      results["[2] uri (string)"] = params.uri === "" ? '""  (empty)' : params.uri
+      results["[3] componentBuildIds (uint256[])"] = JSON.stringify(params.componentBuildIds.map(String))
+      results["[4] componentCounts (uint256[])"] = JSON.stringify(params.componentCounts.map(String))
+      results["[5] kind (uint8)"] = params.kind.toString()
+      results["[6] width (uint8)"] = params.width.toString()
+      results["[7] depth (uint8)"] = params.depth.toString()
+      results["[8] density (uint8)"] = params.density.toString()
+      results["msg.value (wei)"] = FEE_PER_MINT.toString() + " (" + ethers.formatEther(FEE_PER_MINT) + " ETH)"
+      results["to"] = CONTRACTS.BUILD_NFT
+      results["from"] = account
+
+      // Known-good reference payload for comparison
+      results["--- EXPECTED (from user spec) ---"] = ""
+      results["ref[0] geometryHash"] = "0xeb38ea055d70d348cf22350be92b9fd5bd2e313dc6f092d109a07a405aac1a35"
+      results["ref[1] mass"] = "1"
+      results["ref[2] uri"] = '""'
+      results["ref[3] componentBuildIds"] = "[]"
+      results["ref[4] componentCounts"] = "[]"
+      results["ref[5] kind"] = "0"
+      results["ref[6] width"] = "1"
+      results["ref[7] depth"] = "1"
+      results["ref[8] density"] = "1"
+      results["ref msg.value"] = "10000000000000000 (0.01 ETH)"
+      
+      // Add raw calldata
+      try {
+        const calldata = encodeMintCalldata(params)
+        results["--- RAW CALLDATA ---"] = ""
+        results["Function Selector"] = calldata.slice(0, 10)
+        results["Calldata Length"] = calldata.length.toString() + " chars"
+        results["Full Calldata"] = calldata
+      } catch (e: any) {
+        results["Calldata Error"] = e.message
+      }
+      
+      // Add simulation result
+      try {
+        const sim = await simulateMint(provider, params, account)
+        results["--- SIMULATION ---"] = ""
+        results["Simulation Result"] = sim.success ? "SUCCESS" : "REVERTED"
+        if (sim.decodedError) {
+          results["Revert Reason"] = sim.decodedError
+        }
+        results["Raw Result Data"] = sim.result || "(empty)"
+      } catch (e: any) {
+        results["Simulation Error"] = e.message
+      }
+      
+      setDiagnostics(results)
+    } catch (err: any) {
+      setDiagnostics({ "Error": err.message })
+    }
+    setRunningDiagnostics(false)
+  }
+
+  // Handle mint - always sends with gasLimit to bypass estimateGas failures
+  // forceSend uses higher gasLimit (1M vs 500k)
+  const handleMint = async (forceSend = false) => {
     if (!isConnected || !account || !debugData || !generatedHash) return
     setMinting(true)
     setMintError(null)
@@ -270,72 +505,116 @@ export function MintDebugClient() {
       const ethereum = (window as any).ethereum
       if (!ethereum) throw new Error("No wallet found")
       
-      // First verify we're on the right chain
       const currentChainId = await ethereum.request({ method: "eth_chainId" })
       const currentChainDecimal = parseInt(currentChainId, 16)
       const expectedChainDecimal = parseInt(CONTRACTS.BASE_SEPOLIA_CHAIN_ID, 16)
       
       if (currentChainDecimal !== expectedChainDecimal && !skipChecks) {
-        throw new Error(`Wrong network! Current: ${currentChainDecimal}, Expected: ${expectedChainDecimal} (Base Sepolia). Please switch networks.`)
+        throw new Error(`Wrong network! Current: ${currentChainDecimal}, Expected: ${expectedChainDecimal} (Base Sepolia). Please switch networks first.`)
       }
       
       const provider = new ethers.BrowserProvider(ethereum)
-      
-      // Determine if this is a BUILD (has components) or BRICK (no components)
-      const hasComponents = debugData.composition && Object.keys(debugData.composition).length > 0
-      const kind = hasComponents ? BUILD_KIND.BUILD : BUILD_KIND.BRICK
-      
-      // CRITICAL: For bricks, arrays MUST be empty []. Contract requires:
-      // - componentBuildIds[i] != 0
-      // - componentCounts[i] > 0
-      // So we cannot pass any values at all for bricks.
-      let componentIds: bigint[] = []
-      let componentCounts: bigint[] = []
-      
-      if (hasComponents && debugData.composition) {
-        // Only populate for builds with actual components
-        const validComponents = Object.entries(debugData.composition)
-          .filter(([id, data]) => Number(id) > 0 && data.count > 0)
-        componentIds = validComponents.map(([id]) => BigInt(id))
-        componentCounts = validComponents.map(([, data]) => BigInt(data.count))
+      const params = buildMintParams()
+      if (!params) {
+        // buildMintParams already set a detailed mintError via setMintError - just bail
+        if (!mintError) setMintError("Could not build mint params - check density and parameters")
+        setMinting(false)
+        return
       }
 
-      const mintParams: MintParams = {
-        geometryHash: generatedHash,
-        mass: debugData.totalBloxMass,
-        uri: "", // URI is ignored on-chain now
-        componentBuildIds: componentIds,
-        componentCounts: componentCounts,
-        kind,
-        width: debugData.baseWidth,
-        depth: debugData.baseDepth,
-        density: 1,
-      }
-
-      const tx = await mintBuildNFTWithParams(provider, mintParams)
+      // Send tx directly with gasLimit - no staticCall pre-check
+      const tx = await mintBuildNFTWithParams(provider, params, forceSend)
       setMintTxHash(tx.hash)
       
+      // Wait for confirmation
       const receipt = await tx.wait()
+      if (receipt && receipt.status === 0) {
+        throw new Error("Transaction reverted on-chain. Check BaseScan for details.")
+      }
       
-      // Add to local minted hashes
       addMintedHash(generatedHash)
       
-      // Refresh state
+      // Parse tokenId from Transfer event in receipt logs
+      let mintedTokenId: string | null = null
+      if (receipt?.logs) {
+        const contractAddr = CONTRACTS.BUILD_NFT.toLowerCase()
+        const transferTopic = ethers.id("Transfer(address,address,uint256)")
+        for (const log of receipt.logs) {
+          if (log.address.toLowerCase() === contractAddr && log.topics[0] === transferTopic) {
+            mintedTokenId = BigInt(log.topics[3]).toString()
+            break
+          }
+        }
+      }
+      
+      // Save full build data + mint info to Redis
+      if (mintedTokenId && debugData) {
+        const urlKind = searchParams.get("kind")
+        const urlDensity = searchParams.get("density")
+        const urlWidth = searchParams.get("width")
+        const urlDepth = searchParams.get("depth")
+        
+        const mass = debugData.totalBloxMass ?? debugData.bricks.length
+        const colors = debugData.uniqueColors ?? new Set(debugData.bricks.map(b => b.color)).size
+        
+        try {
+          await fetch("/api/builds/mint", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              // Chain data
+              tokenId: mintedTokenId,
+              buildHash: generatedHash,
+              txHash: tx.hash,
+              walletAddress: account,
+              
+              // Build identity
+              buildName: debugData.buildName,
+              
+              // Full geometry
+              bricks: debugData.bricks,
+              baseWidth: debugData.baseWidth,
+              baseDepth: debugData.baseDepth,
+              
+              // Scores (calculated here so they match what was displayed)
+              mass,
+              colors,
+              bw_score: parseFloat((Math.log(1 + mass) * Math.log(2 + colors)).toFixed(2)),
+              
+              // Build type
+              kind: urlKind ? parseInt(urlKind) : (params.kind ?? 0),
+              density: urlDensity ? parseInt(urlDensity) : (params.density ?? 1),
+              brickWidth: urlWidth ? parseInt(urlWidth) : debugData.baseWidth,
+              brickDepth: urlDepth ? parseInt(urlDepth) : debugData.baseDepth,
+              
+              // Composition (which existing NFTs are used in this build)
+              composition: debugData.composition,
+              
+              // Contract params (for verification / future IPFS upload)
+              geometryHash: params.geometryHash,
+              componentBuildIds: params.componentBuildIds,
+              componentCounts: params.componentCounts,
+              
+              // Build metadata
+              metadata: debugData.metadata,
+            }),
+          })
+        } catch (saveErr) {
+          console.error("Failed to save mint to Redis:", saveErr)
+        }
+      }
+      
       await fetchContractState()
     } catch (err: any) {
       console.error("[v0] Mint error:", err)
-      // Parse more detailed error message
       let errorMessage = "Mint failed"
       if (err.reason) {
         errorMessage = err.reason
       } else if (err.message) {
-        // Try to extract useful info from the message
-        if (err.message.includes("require(false)")) {
-          errorMessage = "Contract reverted - check contract requirements (BLOX approval, network, etc.)"
+        if (err.message.includes("user rejected") || err.message.includes("ACTION_REJECTED")) {
+          errorMessage = "Transaction rejected by user"
         } else if (err.message.includes("insufficient funds")) {
           errorMessage = "Insufficient ETH for gas + mint fee (0.01 ETH)"
-        } else if (err.message.includes("user rejected")) {
-          errorMessage = "Transaction rejected by user"
         } else {
           errorMessage = err.message
         }
@@ -596,9 +875,8 @@ export function MintDebugClient() {
                   variant="ghost" 
                   size="sm" 
                   onClick={() => {
+                    const kind = detectKind(searchParams, debugData.bricks.length, debugData.composition)
                     const hasComponents = debugData.composition && Object.keys(debugData.composition).length > 0
-                    const kind = hasComponents ? BUILD_KIND.BUILD : BUILD_KIND.BRICK
-                    // For bricks: MUST be empty arrays. Contract reverts on any values.
                     let componentIds: string[] = []
                     let componentCounts: number[] = []
                     if (hasComponents && debugData.composition) {
@@ -607,11 +885,12 @@ export function MintDebugClient() {
                       componentIds = validComponents.map(([id]) => id)
                       componentCounts = validComponents.map(([, data]) => data.count)
                     }
+                    const mintDensityCopy = parseInt(searchParams.get("density") || "1")
                     const mintParams = {
                       geometryHash: generatedHash || "",
                       mass: debugData.totalBloxMass,
                       kind,
-                      density: 1,
+                      density: mintDensityCopy,
                       width: debugData.baseWidth,
                       depth: debugData.baseDepth,
                       componentBuildIds: componentIds,
@@ -631,9 +910,8 @@ export function MintDebugClient() {
             <CardContent>
               <pre className="p-3 bg-[hsl(var(--ethblox-bg))] rounded-lg text-xs font-mono text-[hsl(var(--ethblox-green))] overflow-auto max-h-80">
 {(() => {
+  const kind = detectKind(searchParams, debugData.bricks.length, debugData.composition)
   const hasComponents = debugData.composition && Object.keys(debugData.composition).length > 0
-  const kind = hasComponents ? BUILD_KIND.BUILD : BUILD_KIND.BRICK
-  // For bricks: MUST be empty arrays
   let componentIds: string[] = []
   let componentCounts: number[] = []
   if (hasComponents && debugData.composition) {
@@ -642,11 +920,12 @@ export function MintDebugClient() {
     componentIds = validComponents.map(([id]) => id)
     componentCounts = validComponents.map(([, data]) => data.count)
   }
+  const mintDensityDisplay = parseInt(searchParams.get("density") || "1")
   return JSON.stringify({
     geometryHash: generatedHash || "generating...",
     mass: debugData.totalBloxMass,
     kind,
-    density: 1,
+    density: mintDensityDisplay,
     width: debugData.baseWidth,
     depth: debugData.baseDepth,
     componentBuildIds: componentIds,
@@ -670,23 +949,21 @@ export function MintDebugClient() {
                   variant="ghost" 
                   size="sm" 
                   onClick={() => {
-                    const kind = debugData.composition && Object.keys(debugData.composition).length > 0 
-                      ? BUILD_KIND.BUILD : BUILD_KIND.BRICK
+                    const kind = detectKind(searchParams, debugData.bricks.length, debugData.composition)
                     const componentIds = debugData.composition 
                       ? Object.keys(debugData.composition) : []
-                    const specKey = generatedHash 
-                      ? generateSpecKey(generatedHash, debugData.baseWidth, debugData.baseDepth)
-                      : ""
+                    const mintDensity = parseInt(searchParams.get("density") || "1")
+                    const specKey = generateSpecKey(debugData.baseWidth, debugData.baseDepth, mintDensity)
                     const componentsHash = generateComponentsHash(componentIds)
                     const metadata = {
                       name: debugData.buildName || `ETHBLOX #${contractState.nextTokenId?.toString() || "?"}`,
                       description: "ETHBLOX build/brick",
-                      image: `ipfs://<CID>/images/${contractState.nextTokenId?.toString() || "?"}.png`,
-                      external_url: "https://ethblox.xyz",
+                      image: tokenImageURI(contractState.nextTokenId?.toString() || "?"),
+                      external_url: "https://ethblox.art",
                       attributes: [
                         { trait_type: "kind", value: kind },
                         { trait_type: "mass", value: debugData.totalBloxMass },
-                        { trait_type: "density", value: 1 },
+                        { trait_type: "density", value: mintDensity },
                         { trait_type: "geometryHash", value: generatedHash || "" },
                         { trait_type: "specKey", value: specKey },
                         { trait_type: "componentsHash", value: componentsHash }
@@ -704,23 +981,21 @@ export function MintDebugClient() {
             <CardContent>
               <pre className="p-3 bg-[hsl(var(--ethblox-bg))] rounded-lg text-xs font-mono text-[hsl(var(--ethblox-accent-cyan))] overflow-auto max-h-96">
 {(() => {
-  const kind = debugData.composition && Object.keys(debugData.composition).length > 0 
-    ? BUILD_KIND.BUILD : BUILD_KIND.BRICK
+  const kind = detectKind(searchParams, debugData.bricks.length, debugData.composition)
   const componentIds = debugData.composition 
     ? Object.keys(debugData.composition) : []
-  const specKey = generatedHash 
-    ? generateSpecKey(generatedHash, debugData.baseWidth, debugData.baseDepth)
-    : "<pending geometryHash>"
+  const mintDensity = parseInt(searchParams.get("density") || "1")
+  const specKey = generateSpecKey(debugData.baseWidth, debugData.baseDepth, mintDensity)
   const componentsHash = generateComponentsHash(componentIds)
   return JSON.stringify({
     name: debugData.buildName || `ETHBLOX #${contractState.nextTokenId?.toString() || "?"}`,
     description: "ETHBLOX build/brick",
-    image: `ipfs://<CID>/images/${contractState.nextTokenId?.toString() || "?"}.png`,
-    external_url: "https://ethblox.xyz",
+    image: tokenImageURI(contractState.nextTokenId?.toString() || "?"),
+    external_url: "https://ethblox.art",
     attributes: [
       { trait_type: "kind", value: kind },
       { trait_type: "mass", value: debugData.totalBloxMass },
-      { trait_type: "density", value: 1 },
+      { trait_type: "density", value: mintDensity },
       { trait_type: "geometryHash", value: generatedHash || "" },
       { trait_type: "specKey", value: specKey },
       { trait_type: "componentsHash", value: componentsHash }
@@ -730,7 +1005,7 @@ export function MintDebugClient() {
               </pre>
               <div className="mt-3 p-2 bg-[hsl(var(--ethblox-bg))] rounded text-xs text-[hsl(var(--ethblox-text-tertiary))]">
                 <p><strong>Token URI:</strong> {"${baseUri}/${tokenId}.json"}</p>
-                <p><strong>Base URI:</strong> ipns://{"<ipns-name>"} or ipfs://{"<folder-cid>"}</p>
+                <p><strong>Base URI:</strong> {BASE_METADATA_URI}</p>
               </div>
             </CardContent>
           </Card>
@@ -932,7 +1207,18 @@ export function MintDebugClient() {
                 </Button>
               </div>
 
-              {/* Approve BLOX Button */}
+              {/* BLOX Balance Warning */}
+              {contractState.bloxBalance !== null && contractState.bloxBalance === 0n && (
+                <div className="p-3 bg-red-500/10 rounded-lg border border-red-500/30">
+                  <p className="text-sm font-medium text-red-400">BLOX Balance is 0</p>
+                  <p className="text-xs text-[hsl(var(--ethblox-text-tertiary))] mt-1">
+                    You need {ethers.formatEther(BigInt(debugData.totalBloxMass) * 10n ** 18n)} BLOX to mint. 
+                    The contract locks BLOX tokens during minting.
+                  </p>
+                </div>
+              )}
+
+              {/* Approve BLOX Button - always show if allowance insufficient */}
               {contractState.bloxAllowance !== null && 
                contractState.bloxAllowance < BigInt(debugData.totalBloxMass) * 10n ** 18n && (
                 <Button
@@ -941,19 +1227,119 @@ export function MintDebugClient() {
                   className="w-full bg-blue-600 hover:bg-blue-700"
                 >
                   {approving && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
-                  Approve BLOX
+                  {approving ? "Approving..." : `Approve BLOX (${debugData.totalBloxMass} BLOX)`}
                 </Button>
               )}
 
-              {/* Mint Button */}
+              {/* Approve status */}
+              {contractState.bloxAllowance !== null && 
+               contractState.bloxAllowance >= BigInt(debugData.totalBloxMass) * 10n ** 18n && (
+                <div className="p-3 bg-green-500/10 rounded-lg border border-green-500/30">
+                  <p className="text-sm text-green-400 flex items-center gap-2">
+                    <CheckCircle2 className="h-4 w-4" />
+                    BLOX Approved ({ethers.formatEther(contractState.bloxAllowance)} BLOX)
+                  </p>
+                </div>
+              )}
+
+              {/* Run Diagnostics Button */}
               <Button
-                onClick={handleMint}
-                disabled={minting || !isConnected || !generatedHash || (!canMint && !skipChecks)}
-                className="w-full bg-gradient-to-r from-yellow-400 to-yellow-500 hover:from-yellow-500 hover:to-yellow-600 text-black font-bold"
+                onClick={handleRunDiagnostics}
+                disabled={runningDiagnostics || !isConnected || !generatedHash}
+                variant="outline"
+                className="w-full border-[hsl(var(--ethblox-accent-cyan))] text-[hsl(var(--ethblox-accent-cyan))] bg-transparent hover:bg-[hsl(var(--ethblox-accent-cyan)/0.1)]"
               >
-                {minting && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
-                {minting ? "Minting..." : `Mint NFT (${ethers.formatEther(FEE_PER_MINT)} ETH)`}
+                {runningDiagnostics && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
+                {runningDiagnostics ? "Running Diagnostics..." : "Run Pre-Mint Diagnostics"}
               </Button>
+
+              {/* Diagnostics Results */}
+              {diagnostics && (
+                <div className="p-3 bg-[hsl(var(--ethblox-bg))] rounded-lg border border-[hsl(var(--ethblox-border))] space-y-1 max-h-[600px] overflow-auto">
+                  <div className="flex justify-between items-center mb-2">
+                    <p className="text-xs font-medium text-[hsl(var(--ethblox-text-primary))]">Diagnostic Results:</p>
+                    <Button 
+                      variant="ghost" 
+                      size="sm" 
+                      className="h-6 px-2 text-xs text-[hsl(var(--ethblox-accent-cyan))]"
+                      onClick={() => {
+                        const text = Object.entries(diagnostics)
+                          .map(([k, v]) => k.startsWith("---") ? `\n${k}` : `${k}: ${String(v ?? "")}`)
+                          .join("\n")
+                        copyToClipboard(text, "allDiagnostics")
+                      }}
+                    >
+                      {copied === "allDiagnostics" ? "Copied!" : "Copy All"}
+                    </Button>
+                  </div>
+                  {Object.entries(diagnostics).map(([key, rawValue]) => {
+                    const value = String(rawValue ?? "")
+                    const isPass = value === "YES" || value.startsWith("YES") || value.includes("available") || value === "SUCCESS"
+                    const isFail = value === "NO" || value.startsWith("NO") || value.includes("FAILED") || value === "REVERTED"
+                    const isSeparator = key.startsWith("---")
+                    const isLongValue = value.length > 80
+                    
+                    if (isSeparator) {
+                      return <Separator key={key} className="bg-[hsl(var(--ethblox-border))] my-2" />
+                    }
+                    
+                    if (isLongValue) {
+                      return (
+                        <div key={key} className="text-xs">
+                          <div className="flex justify-between items-center">
+                            <span className="text-[hsl(var(--ethblox-text-secondary))]">{key}</span>
+                            <Button variant="ghost" size="sm" className="h-5 px-1 text-xs"
+                              onClick={() => copyToClipboard(value, key)}>
+                              {copied === key ? "Copied!" : "Copy"}
+                            </Button>
+                          </div>
+                          <pre className="mt-1 p-2 bg-black/30 rounded text-[10px] font-mono text-[hsl(var(--ethblox-text-tertiary))] break-all whitespace-pre-wrap">
+                            {value}
+                          </pre>
+                        </div>
+                      )
+                    }
+                    
+                    return (
+                      <div key={key} className="flex justify-between text-xs gap-2">
+                        <span className="text-[hsl(var(--ethblox-text-secondary))] shrink-0">{key}</span>
+                        <span className={`font-mono text-right break-all ${
+                          isFail ? "text-red-400" : isPass ? "text-green-400" : "text-[hsl(var(--ethblox-text-primary))]"
+                        }`}>
+                          {value}
+                        </span>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+
+              <Separator className="bg-[hsl(var(--ethblox-border))]" />
+
+              {/* Mint Buttons */}
+              <div className="space-y-2">
+                <Button
+                  onClick={() => handleMint(false)}
+                  disabled={minting || !isConnected || !generatedHash || (!canMint && !skipChecks)}
+                  className="w-full bg-gradient-to-r from-yellow-400 to-yellow-500 hover:from-yellow-500 hover:to-yellow-600 text-black font-bold"
+                >
+                  {minting && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
+                  {minting ? "Sending TX..." : `Mint NFT (${ethers.formatEther(FEE_PER_MINT)} ETH + 500k gas)`}
+                </Button>
+                <Button
+                  onClick={() => handleMint(true)}
+                  disabled={minting || !isConnected || !generatedHash}
+                  variant="outline"
+                  className="w-full border-red-500/50 text-red-400 bg-transparent hover:bg-red-500/10"
+                >
+                  {minting && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
+                  Force Send (1M gas limit)
+                </Button>
+                <p className="text-xs text-[hsl(var(--ethblox-text-tertiary))] text-center">
+                  Both buttons bypass estimateGas. Force Send uses a higher 1M gas limit.
+                  Run diagnostics first to check requirements.
+                </p>
+              </div>
 
               {/* Mint Status */}
               {mintTxHash && (

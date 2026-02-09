@@ -99,36 +99,35 @@ export function MetaMaskProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  // Restore saved session
-  useEffect(() => {
-    const savedAccount = localStorage.getItem("metamask_account")
-    const savedChainId = localStorage.getItem("metamask_chainId")
-
-    if (savedAccount) {
-      setState((prev) => ({
-        ...prev,
-        account: savedAccount,
-        chainId: savedChainId,
-        isConnected: true,
-      }))
-    }
-  }, [])
-
-  // Check MetaMask installation and setup listeners
+  // Restore saved session AND verify with MetaMask in a single effect
+  // This avoids the race condition of trusting localStorage then overwriting from MetaMask
   useEffect(() => {
     const ethereum = getEthereum()
     const isMetaMaskInstalled = Boolean(ethereum && ethereum.isMetaMask)
 
     setState((prev) => ({ ...prev, isInstalled: isMetaMaskInstalled }))
 
-    if (!isMetaMaskInstalled) return
+    if (!isMetaMaskInstalled) {
+      // No MetaMask - try localStorage as fallback (e.g. MetaMask mobile deep link return)
+      const savedAccount = localStorage.getItem("metamask_account")
+      const savedChainId = localStorage.getItem("metamask_chainId")
+      if (savedAccount) {
+        setState((prev) => ({
+          ...prev,
+          account: savedAccount,
+          chainId: savedChainId,
+          isConnected: true,
+        }))
+      }
+      return
+    }
 
-    // Auto-reconnect
+    // MetaMask is installed - verify actual connection state
     ethereum
       .request({ method: "eth_accounts" })
       .then((accounts: string[]) => {
         if (accounts.length > 0) {
-          ethereum.request({ method: "eth_chainId" }).then((chainId: string) => {
+          return ethereum.request({ method: "eth_chainId" }).then((chainId: string) => {
             localStorage.setItem("metamask_account", accounts[0])
             localStorage.setItem("metamask_chainId", chainId)
             setState((prev) => ({
@@ -140,6 +139,35 @@ export function MetaMaskProvider({ children }: { children: ReactNode }) {
               isMetaMaskBrowser: true,
             }))
           })
+        } else {
+          // MetaMask is installed but no accounts authorized
+          // Check localStorage for a previously connected session
+          const savedAccount = localStorage.getItem("metamask_account")
+          if (savedAccount) {
+            // Silently request accounts to re-authorize
+            return ethereum.request({ method: "eth_requestAccounts" })
+              .then((accts: string[]) => {
+                if (accts.length > 0) {
+                  return ethereum.request({ method: "eth_chainId" }).then((chainId: string) => {
+                    localStorage.setItem("metamask_account", accts[0])
+                    localStorage.setItem("metamask_chainId", chainId)
+                    setState((prev) => ({
+                      ...prev,
+                      account: accts[0],
+                      chainId,
+                      isConnected: true,
+                      isInstalled: true,
+                      isMetaMaskBrowser: true,
+                    }))
+                  })
+                }
+              })
+              .catch(() => {
+                // User rejected re-auth, clear stale session
+                localStorage.removeItem("metamask_account")
+                localStorage.removeItem("metamask_chainId")
+              })
+          }
         }
       })
       .catch(console.error)

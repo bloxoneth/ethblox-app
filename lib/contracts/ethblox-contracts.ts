@@ -3,6 +3,39 @@ import { ethers } from "ethers"
 // Constants
 export const FEE_PER_MINT = ethers.parseEther("0.01") // 0.01 ETH mint fee
 export const BLOX_DECIMALS = 18n
+export const MINT_GAS_LIMIT = 700_000n // 600-800k recommended for BuildNFT.mint
+export const MINT_GAS_LIMIT_FORCE = 800_000n // upper bound when force-sending
+
+// Metadata via IPFS - baseTokenURI is set on-chain, no per-token URIs needed
+export const BASE_METADATA_CID = "bafybeihf3bprrm6gr5prmzatwnjlnl3pmygw5xh44tvnwccejqo2yfoaii"
+export const BASE_METADATA_URI =
+  process.env.NEXT_PUBLIC_BASE_METADATA_URI ?? `ipfs://${BASE_METADATA_CID}`
+export const BASE_METADATA_GATEWAY =
+  process.env.NEXT_PUBLIC_BASE_METADATA_GATEWAY ??
+  `https://gateway.lighthouse.storage/ipfs/${BASE_METADATA_CID}`
+export const tokenMetadataURI = (tokenId: string | number) =>
+  `${BASE_METADATA_URI}/${tokenId}.json`
+export const tokenMetadataGatewayURL = (tokenId: string | number) =>
+  `${BASE_METADATA_GATEWAY}/${tokenId}.json`
+
+// Images via IPFS - stored at root of images CID (no /images/ folder)
+export const IMAGES_CID =
+  process.env.NEXT_PUBLIC_IMAGES_CID ??
+  "bafybeibnk4kq7mesrs7wtwi2ypwlnxhazoqkwgoycol55n64tqseox2q2a"
+export const IMAGES_GATEWAY =
+  process.env.NEXT_PUBLIC_IMAGES_GATEWAY ??
+  `https://gateway.lighthouse.storage/ipfs/${IMAGES_CID}`
+export const tokenImageURI = (tokenId: string | number) =>
+  `ipfs://${IMAGES_CID}/${tokenId}.png`
+export const tokenImageGatewayURL = (tokenId: string | number) =>
+  `${IMAGES_GATEWAY}/${tokenId}.png`
+
+// Resolve any ipfs:// URI to a gateway URL
+export const resolveIPFS = (uri: string) => {
+  const gateway =
+    process.env.NEXT_PUBLIC_IPFS_GATEWAY ?? "https://gateway.lighthouse.storage/ipfs/"
+  return uri.replace("ipfs://", gateway)
+}
 
 // Build kinds
 export const BUILD_KIND = {
@@ -10,9 +43,13 @@ export const BUILD_KIND = {
   BUILD: 1, // kind>0 for composite builds
 } as const
 
-// Contract addresses on Base Sepolia (Fresh deployment - Feb 2026)
+// Network: Base Sepolia (chain ID 84532)
+export const CHAIN_ID = 84532
+export const RPC_URL = process.env.NEXT_PUBLIC_RPC_URL || process.env.BASE_SEPOLIA_RPC_URL || "https://sepolia.base.org"
+
+// Contract addresses on Base Sepolia
 export const CONTRACTS = {
-  MOCK_BLOX: "0x6578d53995FEB0e486135b893B8bC16AE1a5Ec52", // Unchanged - BLOX token
+  MOCK_BLOX: "0x6578d53995FEB0e486135b893B8bC16AE1a5Ec52",
   BUILD_NFT: "0x6Da8ABFeCfd468E6CfCc551E014388f7B279f1A3",
   LICENSE_REGISTRY: "0x6Fe315D0CA4EB570dC96d2b1C7E2a287d492Cc5A",
   LICENSE_NFT: "0xfEb8dCa56E849E91E7D3B4a2Ba2673Bb5FDf080E",
@@ -29,21 +66,27 @@ export const MOCK_BLOX_ABI = [
   "function symbol() view returns (string)",
 ]
 
-// BuildNFT ABI - extended with kind, brickSpec, and state reading
+// BuildNFT ABI
+// Confirmed from on-chain tx 0x37c60c0d: MethodID 0x0923bb28
+// mint(bytes32,uint256,string,uint256[],uint256[],uint8,uint8,uint8,uint16)
+// Note: density is uint16 (NOT uint8)
 export const BUILD_NFT_ABI = [
-  // Minting - new format per contract spec
-  "function mint(bytes32 geometryHash, uint256 mass, string uri, uint256[] componentBuildIds, uint256[] componentCounts, uint8 kind, uint8 width, uint8 depth, uint8 density) payable",
-  // Legacy minting functions (may still exist)
-  "function mintBrick(bytes32 geometryHash, uint8 width, uint8 depth, uint8 density)",
-  "function mintBuild(bytes32 geometryHash, uint256 mass, uint8 kind, uint256[] calldata componentTokenIds)",
+  "function mint(bytes32 geometryHash, uint256 mass, string uri, uint256[] componentBuildIds, uint256[] componentCounts, uint8 kind, uint8 width, uint8 depth, uint16 density) payable",
+  "function isMinter(address) view returns (bool)",
+  "function mintingOpen() view returns (bool)",
   // State reading
   "function kind(uint256 tokenId) view returns (uint8)",
   "function geometryHash(uint256 tokenId) view returns (bytes32)",
-  "function brickSpec(uint256 tokenId) view returns (uint8 width, uint8 depth, uint8 density)",
+  "function brickSpec(uint256 tokenId) view returns (uint8 width, uint8 depth, uint16 density)",
   "function lockedBlox(uint256 tokenId) view returns (uint256)",
   "function escrowedLicenses(uint256 tokenId, uint256 licenseId) view returns (uint256)",
   "function maxMass() view returns (uint256)",
   "function nextTokenId() view returns (uint256)",
+  "function hashToTokenId(bytes32) view returns (uint256)",
+  "function paused() view returns (bool)",
+  "function bloxToken() view returns (address)",
+  "function mintFee() view returns (uint256)",
+  "function owner() view returns (address)",
   // ERC721 standard
   "function balanceOf(address owner) view returns (uint256)",
   "function ownerOf(uint256 tokenId) view returns (address)",
@@ -156,13 +199,147 @@ export interface MintParams {
   density: number
 }
 
+// Run pre-mint diagnostics - returns an object with all checks
+export async function runMintDiagnostics(
+  provider: ethers.BrowserProvider,
+  params: MintParams,
+  sender: string,
+): Promise<Record<string, string>> {
+  const results: Record<string, string> = {}
+  
+  try {
+    const bloxContract = new ethers.Contract(CONTRACTS.MOCK_BLOX, MOCK_BLOX_ABI, provider)
+    const buildContract = new ethers.Contract(CONTRACTS.BUILD_NFT, BUILD_NFT_ABI, provider)
+    
+    // Network
+    const network = await provider.getNetwork()
+    results["Chain ID"] = `${network.chainId} (expected: 84532)`
+    results["Correct Chain"] = network.chainId === 84532n ? "YES" : "NO"
+    
+    // Contract state checks
+    results["--- CONTRACT STATE ---"] = ""
+    
+    try {
+      const paused = await buildContract.paused()
+      results["Contract Paused"] = paused ? "YES (MINTING BLOCKED!)" : "NO"
+    } catch { results["Contract Paused"] = "N/A (no paused() function)" }
+    
+    try {
+      const bloxTokenAddr = await buildContract.bloxToken()
+      results["Contract BLOX Token Addr"] = bloxTokenAddr
+      results["BLOX Addr Matches Our Config"] = bloxTokenAddr.toLowerCase() === CONTRACTS.MOCK_BLOX.toLowerCase() ? "YES" : `NO! Contract uses ${bloxTokenAddr}, we use ${CONTRACTS.MOCK_BLOX}`
+    } catch { results["Contract BLOX Token Addr"] = "N/A (no bloxToken() function)" }
+    
+    try {
+      const onChainFee = await buildContract.mintFee()
+      results["On-chain Mint Fee"] = `${ethers.formatEther(onChainFee)} ETH (raw: ${onChainFee.toString()})`
+      results["Our Fee Matches"] = onChainFee === FEE_PER_MINT ? "YES" : `NO! Contract wants ${ethers.formatEther(onChainFee)} ETH, we send ${ethers.formatEther(FEE_PER_MINT)} ETH`
+    } catch { results["On-chain Mint Fee"] = "N/A (no mintFee() function)" }
+    
+    try {
+      const contractOwner = await buildContract.owner()
+      results["Contract Owner"] = contractOwner
+      results["Sender Is Owner"] = contractOwner.toLowerCase() === sender.toLowerCase() ? "YES" : "NO"
+    } catch { results["Contract Owner"] = "N/A (no owner() function)" }
+    
+    // Check for whitelist/minter role
+    try {
+      const isMinter = await buildContract.isMinter(sender)
+      results["Is Minter (whitelisted)"] = isMinter ? "YES" : "NO (MAY BLOCK MINTING!)"
+    } catch { results["Is Minter"] = "N/A (no isMinter() function)" }
+    
+    try {
+      const mintingOpen = await buildContract.mintingOpen()
+      results["Minting Open"] = mintingOpen ? "YES" : "NO (MINTING CLOSED!)"
+    } catch { results["Minting Open"] = "N/A (no mintingOpen() function)" }
+    
+    try {
+      const nextId = await buildContract.nextTokenId()
+      results["Next Token ID"] = nextId.toString()
+    } catch { results["Next Token ID"] = "FAILED TO READ" }
+    
+    try {
+      const maxM = await buildContract.maxMass()
+      results["Max Mass"] = maxM.toString()
+      results["Mass Within Limit"] = BigInt(params.mass) <= maxM ? "YES" : `NO (mass ${params.mass} > max ${maxM})`
+    } catch { results["Max Mass"] = "FAILED TO READ" }
+    
+    // Hash check
+    results["--- HASH CHECK ---"] = ""
+    results["Geometry Hash"] = params.geometryHash
+    try {
+      const hashToToken = await buildContract.hashToTokenId(params.geometryHash)
+      results["Hash Already Minted"] = hashToToken > 0n ? `YES - TOKEN #${hashToToken} (WILL REVERT!)` : "NO (available)"
+    } catch { results["Hash Already Minted"] = "COULD NOT CHECK (no hashToTokenId function)" }
+    
+    // BLOX checks
+    results["--- BLOX TOKEN ---"] = ""
+    const balance = await bloxContract.balanceOf(sender)
+    results["BLOX Balance"] = `${ethers.formatEther(balance)} BLOX (raw: ${balance.toString()})`
+    
+    const allowance = await bloxContract.allowance(sender, CONTRACTS.BUILD_NFT)
+    results["BLOX Allowance (to BuildNFT)"] = `${ethers.formatEther(allowance)} BLOX (raw: ${allowance.toString()})`
+    
+    const requiredBlox = BigInt(params.mass) * 10n ** 18n
+    results["Required BLOX"] = `${ethers.formatEther(requiredBlox)} (mass=${params.mass})`
+    results["Balance Sufficient"] = balance >= requiredBlox ? "YES" : `NO (need ${ethers.formatEther(requiredBlox - balance)} more)`
+    results["Allowance Sufficient"] = allowance >= requiredBlox ? "YES" : `NO (need ${ethers.formatEther(requiredBlox - allowance)} more)`
+    
+    // ETH check
+    results["--- ETH ---"] = ""
+    const ethBalance = await provider.getBalance(sender)
+    results["ETH Balance"] = `${ethers.formatEther(ethBalance)} ETH`
+    results["ETH Sufficient"] = ethBalance >= FEE_PER_MINT ? "YES" : "NO (need 0.01 ETH)"
+    
+    // Mint params summary
+    results["--- MINT PARAMS ---"] = ""
+    results["kind"] = params.kind.toString()
+    results["mass"] = params.mass.toString()
+    results["width"] = params.width.toString()
+    results["depth"] = params.depth.toString()
+    results["density"] = params.density.toString()
+    results["componentBuildIds"] = `[${params.componentBuildIds.map(String).join(", ")}] (length: ${params.componentBuildIds.length})`
+    results["componentCounts"] = `[${params.componentCounts.map(String).join(", ")}] (length: ${params.componentCounts.length})`
+    results["uri"] = params.uri === "" ? '""  (empty string)' : params.uri
+    
+  } catch (err: any) {
+    results["Diagnostic Error"] = err.message
+  }
+  
+  return results
+}
+
 export async function mintBuildNFTWithParams(
   provider: ethers.BrowserProvider,
   params: MintParams,
+  forceSend = false,
 ): Promise<ethers.ContractTransactionResponse> {
   const signer = await provider.getSigner()
-  const contract = new ethers.Contract(CONTRACTS.BUILD_NFT, BUILD_NFT_ABI, signer)
-  return await contract.mint(
+  
+  // JSON ABI matching on-chain contract (MethodID: 0x0923bb28)
+  // density is uint16 (NOT uint8) - confirmed from BaseScan tx 0x37c60c0d
+  const mintAbi = [{
+    type: "function",
+    name: "mint",
+    stateMutability: "payable",
+    inputs: [
+      { name: "geometryHash", type: "bytes32" },
+      { name: "mass", type: "uint256" },
+      { name: "uri", type: "string" },
+      { name: "componentBuildIds", type: "uint256[]" },
+      { name: "componentCounts", type: "uint256[]" },
+      { name: "kind", type: "uint8" },
+      { name: "width", type: "uint8" },
+      { name: "depth", type: "uint8" },
+      { name: "density", type: "uint16" },
+    ],
+    outputs: [],
+  }]
+  
+  const contract = new ethers.Contract(CONTRACTS.BUILD_NFT, mintAbi, signer)
+  
+  // Log the populated transaction to verify calldata before sending
+  const populated = await contract.mint.populateTransaction(
     params.geometryHash,
     BigInt(params.mass),
     params.uri,
@@ -172,8 +349,106 @@ export async function mintBuildNFTWithParams(
     params.width,
     params.depth,
     params.density,
-    { value: FEE_PER_MINT }
+    { value: FEE_PER_MINT, gasLimit: forceSend ? MINT_GAS_LIMIT_FORCE : MINT_GAS_LIMIT }
   )
+  
+  if (!populated.data || populated.data.length < 10) {
+    throw new Error(`Calldata is empty or too short: "${populated.data}"`)
+  }
+  
+  const tx = await signer.sendTransaction({
+    to: populated.to,
+    data: populated.data,
+    value: FEE_PER_MINT,
+    gasLimit: forceSend ? MINT_GAS_LIMIT_FORCE : MINT_GAS_LIMIT,
+  })
+  
+  return tx
+}
+
+// Encode calldata for mint - density is uint16
+export function encodeMintCalldata(params: MintParams): string {
+  const mintAbi = [{
+    type: "function",
+    name: "mint",
+    stateMutability: "payable",
+    inputs: [
+      { name: "geometryHash", type: "bytes32" },
+      { name: "mass", type: "uint256" },
+      { name: "uri", type: "string" },
+      { name: "componentBuildIds", type: "uint256[]" },
+      { name: "componentCounts", type: "uint256[]" },
+      { name: "kind", type: "uint8" },
+      { name: "width", type: "uint8" },
+      { name: "depth", type: "uint8" },
+      { name: "density", type: "uint16" },
+    ],
+    outputs: [],
+  }]
+  const iface = new ethers.Interface(mintAbi)
+  return iface.encodeFunctionData("mint", [
+    params.geometryHash,
+    BigInt(params.mass),
+    params.uri,
+    params.componentBuildIds,
+    params.componentCounts,
+    params.kind,
+    params.width,
+    params.depth,
+    params.density,
+  ])
+}
+
+// Simulate mint via eth_call using the signer (ensures from is set correctly)
+export async function simulateMint(
+  provider: ethers.BrowserProvider,
+  params: MintParams,
+  from: string,
+): Promise<{ success: boolean; result: string; decodedError?: string }> {
+  const calldata = encodeMintCalldata(params)
+  const signer = await provider.getSigner()
+  
+  // Use signer.call() which automatically sets from to the signer's address
+  // and properly routes through MetaMask's eth_call
+  try {
+    const result = await signer.call({
+      to: CONTRACTS.BUILD_NFT,
+      data: calldata,
+      value: FEE_PER_MINT,
+      gasLimit: 500_000n, // Include gas limit to avoid out-of-gas in simulation
+    })
+    return { success: true, result }
+  } catch (err: any) {
+    // Try to extract revert data from various error shapes
+    const data = err.data || err.error?.data || err.info?.error?.data || "0x"
+    let decodedError = undefined
+    
+    if (data && data !== "0x" && data.length > 2) {
+      // Try to decode as Error(string) - selector 0x08c379a0
+      if (data.startsWith("0x08c379a0")) {
+        try {
+          const decoded = ethers.AbiCoder.defaultAbiCoder().decode(["string"], "0x" + data.slice(10))
+          decodedError = `Revert: "${decoded[0]}"`
+        } catch {
+          decodedError = `Raw revert data: ${data}`
+        }
+      } else {
+        decodedError = `Raw revert data: ${data}`
+      }
+    } else {
+      // No revert data - try to extract from error message
+      const msg = err.message || ""
+      if (msg.includes("insufficient funds")) {
+        decodedError = "Insufficient ETH (need 0.01 ETH for mint fee + gas)"
+      } else if (msg.includes("require(false)")) {
+        decodedError = "Bare require(false) - contract rejected call. Check BLOX approval, balance, and fee."
+      } else {
+        decodedError = `No revert data. Error: ${msg.slice(0, 200)}`
+      }
+    }
+    
+    return { success: false, result: data, decodedError }
+  }
 }
 
 export async function burnBuildNFT(
@@ -308,14 +583,15 @@ export interface BuildState {
 export async function getBuildState(
   provider: ethers.BrowserProvider,
   tokenId: bigint,
-): Promise<BuildState> {
-  const contract = new ethers.Contract(CONTRACTS.BUILD_NFT, BUILD_NFT_ABI, provider)
-  
-  const [kind, geometryHash, lockedBlox] = await Promise.all([
-    contract.kind(tokenId),
-    contract.geometryHash(tokenId),
-    contract.lockedBlox(tokenId),
-  ])
+): Promise<BuildState | null> {
+  try {
+    const contract = new ethers.Contract(CONTRACTS.BUILD_NFT, BUILD_NFT_ABI, provider)
+    
+    const [kind, geometryHash, lockedBlox] = await Promise.all([
+      contract.kind(tokenId),
+      contract.geometryHash(tokenId),
+      contract.lockedBlox(tokenId),
+    ])
 
   const state: BuildState = {
     kind: Number(kind),
@@ -334,6 +610,10 @@ export async function getBuildState(
   }
 
   return state
+  } catch {
+    // Token may not support getBuildState (e.g. test mints, non-burnable builds)
+    return null
+  }
 }
 
 export async function getEscrowedLicenses(

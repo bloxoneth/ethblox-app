@@ -101,8 +101,14 @@ export function getSuggestedMintPrice(brick: BrickNFT): number {
   return 0.01 // Fixed mint fee from contract
 }
 
-// Format brick display name
+// Format brick display name: WxD-D(x) e.g. 2x2-D1 (always normalized min x max)
 export function formatBrickName(brick: BrickNFT): string {
-  const densityLabel = brick.density > 1 ? ` (D${brick.density})` : ""
-  return `${brick.width}x${brick.depth} Brick${densityLabel}`
+  return normalizeBrickKey(brick.width, brick.depth, brick.density)
+}
+
+// Normalize a brick key so 1x2-D1 and 2x1-D1 produce the same string
+export function normalizeBrickKey(w: number, d: number, density: number): string {
+  const minDim = Math.min(w, d)
+  const maxDim = Math.max(w, d)
+  return `${minDim}x${maxDim}-D${density}`
 }

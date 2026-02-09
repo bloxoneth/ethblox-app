@@ -15,6 +15,12 @@ type MintedBuild = {
   buildId?: string
   geoHash?: string
   bricks?: Brick[] // Make bricks optional to handle both embedded and lazy loading
+  kind?: number
+  brickWidth?: number
+  brickDepth?: number
+  baseWidth?: number
+  baseDepth?: number
+  density?: number
 }
 
 const loadNFTBuildData = async (tokenId: number): Promise<Brick[] | null> => {
@@ -133,6 +139,7 @@ export default function V0BlocksV2({
   >([])
   const [isNFTCounterExpanded, setIsNFTCounterExpanded] = useState(false)
   const [brickCounts, setBrickCounts] = useState<Array<{ width: number; depth: number; count: number; minted: boolean }>>([])
+  const [brickSizeOverride, setBrickSizeOverride] = useState<{ width: number; depth: number } | null>(null)
 
   const nftCounts = useMemo(() => {
     const counts = new Map<number, { name: string; tokenId: number; bricksCount: number; count: number }>()
@@ -315,29 +322,39 @@ export default function V0BlocksV2({
         console.warn("[v0] This means the vertical structure was NOT preserved when the NFT was saved.")
       }
 
-      const normalizedBricks = nftBrickGeometry.map((b: Brick) => ({
-        ...b,
-        position: [Math.round(b.position[0] - minX), b.position[1] - minY, Math.round(b.position[2] - minZ)] as [
-          number,
-          number,
-          number,
-        ],
-      }))
+      // Kind 0 brick NFTs: use the regular brick tool with brickWidth/brickDepth
+      // This avoids issues where a single brick was saved as multiple sub-bricks
+      const buildKind = nft.kind ?? 0
+      const brickW = nft.brickWidth ?? nft.baseWidth
+      const brickD = nft.brickDepth ?? nft.baseDepth
+      
+      if (buildKind === 0 && brickW && brickD) {
+        setNftGeometry(null)
+        setNftInfo(null)
+        setBrickSizeOverride({ width: brickW, depth: brickD })
+        toast({
+          title: `${nft.name || `Build #${nft.tokenId}`}`,
+          description: `Brick size set to ${brickW}x${brickD}. Click to place!`,
+        })
+      } else {
+        // Multi-brick builds: normalize positions (preserve exact sub-stud offsets)
+        const normalizedBricks = nftBrickGeometry.map((b: Brick) => ({
+          ...b,
+          position: [b.position[0] - minX, b.position[1] - minY, b.position[2] - minZ] as [
+            number,
+            number,
+            number,
+          ],
+        }))
 
-      const normalizedYValues = [...new Set(normalizedBricks.map((b: Brick) => b.position[1]))].sort((a, b) => a - b)
-      console.log("[v0] ===== AFTER NORMALIZATION =====")
-      console.log("[v0] Unique Y values after normalization:", normalizedYValues)
-      console.log("[v0] First 5 normalized bricks:")
-      normalizedBricks.slice(0, 5).forEach((b, i) => {
-        console.log(`[v0]   Brick ${i}: position=[${b.position.join(",")}]`)
-      })
-
-      setNftGeometry(normalizedBricks)
-      setNftInfo({ tokenId: nft.tokenId, name: nft.name, bricksCount: normalizedBricks.length })
-      toast({
-        title: "NFT Ready",
-        description: `${nft.name || `Build #${nft.tokenId}`} loaded with ${uniqueRawYValues.length} layer(s). Click to place!`,
-      })
+        setBrickSizeOverride(null)
+        setNftGeometry(normalizedBricks)
+        setNftInfo({ tokenId: nft.tokenId, name: nft.name, bricksCount: normalizedBricks.length })
+        toast({
+          title: "NFT Ready",
+          description: `${nft.name || `Build #${nft.tokenId}`} loaded with ${uniqueRawYValues.length} layer(s). Click to place!`,
+        })
+      }
     } else {
       console.error("[v0] Failed to load NFT geometry")
       toast({
@@ -425,6 +442,7 @@ export default function V0BlocksV2({
       setNftGeometry(null)
       setNftInfo(null)
     }
+    setBrickSizeOverride(null)
   }
 
   // Rotate NFT geometry 90 degrees clockwise
@@ -449,16 +467,14 @@ export default function V0BlocksV2({
     <div className="h-full w-full relative">
       <V0Blocks
         initialLoadedBuild={initialLoadedBuild}
-        nftGeometry={nftGeometry}
-        nftInfo={nftInfo}
-        onNFTPlaced={handleNFTPlaced}
-        onBricksCleared={handleBricksCleared}
-        onBricksDeleted={handleBricksDeleted}
-        onBricksChanged={handleBricksChanged}
-        nftComposition={nftComposition}
-        initialBricks={initialBricks}
-        onAutoSave={onAutoSave}
-        onClearNFTMode={handleClearNFTMode}
+      nftGeometry={nftGeometry}
+      nftInfo={nftInfo}
+      onNFTPlaced={handleNFTPlaced}
+      onBricksCleared={handleBricksCleared}
+      onBricksDeleted={handleBricksDeleted}
+      onBricksChanged={handleBricksChanged}
+      onClearNFTMode={handleClearNFTMode}
+      onSetBrickSize={brickSizeOverride}
         onOpenNFTDrawer={() => {
           console.log("[v0] NFT button clicked")
           setShowNFTDrawer(true)
